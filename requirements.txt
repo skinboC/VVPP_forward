@@ -9,3 +9,5 @@ numpy
 scipy
 polyscope
 sounddevice
+libigl
+tqdm

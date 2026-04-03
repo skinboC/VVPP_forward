@@ -3,7 +3,8 @@ import sys
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from torch.utils.data import DataLoader, random_split
+from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch.utils.data import random_split
 
 # Add project root to sys.path
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +30,7 @@ def main():
     
     # You can change this to VVImpactDataset depending on your task
     dataset = EigenMeshDataset(
-        data_dir=os.path.join(cfg.DATA_DIR, "eigen_mesh"),
+        data_dir=os.path.join(cfg.DATA_DIR, "coarse_eigen_mesh"),
         cache_dir=os.path.join(cfg.DATA_DIR, "cache"),
         k=cfg.N_EIGENMODES
     )
@@ -44,19 +45,21 @@ def main():
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
     # Create DataLoaders
-    # Note: custom collate_fn might be needed depending on what the dataset returns
-    train_loader = DataLoader(
+    # Using PyTorch Geometric DataLoader to properly batch graph data (handles pos, x, batch_idx correctly)
+    train_loader = PyGDataLoader(
         train_dataset, 
         batch_size=cfg.BATCH_SIZE, 
         shuffle=True, 
-        num_workers=cfg.NUM_WORKERS
+        num_workers=cfg.NUM_WORKERS,
+        persistent_workers=True if cfg.NUM_WORKERS > 0 else False
     )
     
-    val_loader = DataLoader(
+    val_loader = PyGDataLoader(
         val_dataset, 
         batch_size=cfg.BATCH_SIZE, 
         shuffle=False, 
-        num_workers=cfg.NUM_WORKERS
+        num_workers=cfg.NUM_WORKERS,
+        persistent_workers=True if cfg.NUM_WORKERS > 0 else False
     )
     
     print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
@@ -85,10 +88,12 @@ def main():
     )
     
     # 5. Initialize Trainer
+    # Since torch-cluster's fps op fails on MPS (Mac GPU) and only works on CPU/CUDA,
+    # we explicitly set accelerator="cpu" for now to avoid the RuntimeError.
     trainer = pl.Trainer(
-        max_epochs=cfg.MAX_EPOCHS,
+        max_epochs=cfg.MAX_EPOCHS, 
         callbacks=[checkpoint_callback, early_stop_callback],
-        accelerator="auto",  # Automatically use GPU/MPS if available
+        accelerator="cpu",  # Force CPU to avoid torch-cluster MPS bugs
         devices=1,
         log_every_n_steps=1, # Adjust this based on your dataset size
         default_root_dir=os.path.join(project_root, "logs")

@@ -1,10 +1,11 @@
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
+import igl
 
 def compute_laplacian_eigenmodes(points, elements, k=10):
     """
-    Computes the first k non-trivial eigenmodes of the graph Laplacian for a given mesh.
+    Computes the first k non-trivial eigenmodes of the cotangent Laplacian for a given mesh.
     
     Args:
         points: (N, 3) numpy array of vertex coordinates.
@@ -15,44 +16,31 @@ def compute_laplacian_eigenmodes(points, elements, k=10):
         vals: (k,) eigenvalues.
         vecs: (N, k) eigenvectors.
     """
-    num_points = len(points)
-    
-    # Extract edges based on element type (triangles or tetrahedra)
-    if elements.shape[1] == 3: # Triangles
-        edges = np.vstack((elements[:, [0, 1]], 
-                           elements[:, [1, 2]], 
-                           elements[:, [2, 0]]))
-    elif elements.shape[1] == 4: # Tetrahedra
-        edges = np.vstack((elements[:, [0, 1]], elements[:, [0, 2]], elements[:, [0, 3]],
-                           elements[:, [1, 2]], elements[:, [1, 3]], elements[:, [2, 3]]))
-    else:
+    if elements.shape[1] not in [3, 4]:
         raise ValueError("Elements must be triangles (3 vertices) or tetrahedra (4 vertices).")
         
-    # Ensure unique undirected edges
-    edges = np.sort(edges, axis=1)
-    edges = np.unique(edges, axis=0)
+    # 1. Compute cotangent Laplacian matrix (sparse)
+    # igl.cotmatrix returns a negative semi-definite matrix, so we negate it to make it positive semi-definite.
+    L = -igl.cotmatrix(points, elements)
     
-    # Build sparse adjacency matrix
-    data = np.ones(len(edges))
-    A = sp.coo_matrix((data, (edges[:, 0], edges[:, 1])), shape=(num_points, num_points))
-    A = A + A.T # Make it symmetric
+    # 2. Compute mass matrix (sparse) for the generalized eigenvalue problem
+    # Using Voronoi areas (default) for the mass matrix.
+    M = igl.massmatrix(points, elements, igl.MASSMATRIX_TYPE_VORONOI)
     
-    # Build degree matrix
-    degrees = np.array(A.sum(axis=1)).flatten()
-    D = sp.diags(degrees)
+    # 3. Solve generalized eigenvalue problem: L * x = lambda * M * x
+    # We need k+1 modes because the first one is the constant mode (eigenvalue ~ 0)
+    # Using shift-invert mode (sigma=-1e-8) is highly recommended and much faster for finding smallest eigenvalues.
+    try:
+        vals, vecs = eigsh(L, k=k+1, M=M, sigma=-1e-8, which='LM')
+    except Exception as e:
+        print(f"Shift-invert eigsh failed: {e}. Falling back to standard SM mode...")
+        vals, vecs = eigsh(L, k=k+1, M=M, which='SM')
     
-    # Compute graph Laplacian
-    L = D - A
-    
-    # Compute eigenvalues and eigenvectors
-    # We compute k+1 modes because the first one is the trivial constant mode (eigenvalue ~ 0)
-    # Using shift-invert mode (sigma=-1e-5) is much faster and more stable for finding eigenvalues near 0
-    vals, vecs = eigsh(L.astype(float), k=k+1, sigma=-1e-5, which='LM')
-    
-    # Sort the results by eigenvalue
+    # 4. Sort the eigenvalues and eigenvectors (eigsh doesn't strictly guarantee order)
     idx = np.argsort(vals)
     vals = vals[idx]
     vecs = vecs[:, idx]
     
-    # Skip the first mode (constant mode with eigenvalue 0)
-    return vals[1:], vecs[:, 1:]
+    # 5. Skip the first mode (constant mode with eigenvalue 0)
+    return vals[1:k+1], vecs[:, 1:k+1]
+
