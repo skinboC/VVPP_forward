@@ -3,11 +3,11 @@ import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
+import ocnn
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.data import Batch, Data
 from torch_geometric.nn import global_max_pool
 
 # 确保项目根目录在 sys.path 中
@@ -16,7 +16,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from config.config import cfg
-import src.models.pointnet2 as pointnet2
+import src.models.ocnn_model_ref.my_ocnn as ocnn_unet
 
 
 class FiLMResidualBlock(nn.Module):
@@ -95,12 +95,8 @@ class MyPipeline(pl.LightningModule):
         self.learning_rate = learning_rate if learning_rate is not None else getattr(cfg, "LEARNING_RATE", 1e-3)
         self.hidden_dim = getattr(cfg, "HIDDEN_DIM", 256)
         self.output_dim = getattr(cfg, "OUTPUT_DIM", 64)
-
-        # ====== 阶段 A: 几何声学基底提取 (GNN) ======
-        # 使用 PointNet++ 将 3D 网格的物理空间结构映射到高维特征空间
-        self.gnn = pointnet2.DeepPointNet2(in_channels=3, out_channels=self.hidden_dim)
-        
-        # ====== 阶段 B & C: 级联特征调制解码器 ======
+        self.input_feature = ocnn.modules.InputFeature("ND", nempty=cfg.OCTREE_NEMPTY)
+        self.backbone_network = ocnn_unet.UNet(in_channels=4, out_channels=self.hidden_dim, nempty=cfg.OCTREE_NEMPTY)
         self.decoder = L2G_FiLM_Decoder(
             hidden_dim=self.hidden_dim,
             output_dim=self.output_dim,
@@ -178,37 +174,30 @@ class MyPipeline(pl.LightningModule):
         return image
 
     def forward(self, batch_data):
-        """
-        前向推理函数：将输入 3D 网格和敲击点转化为声音特征向量
-        """
-        positions = [pos.to(self.device) for pos in batch_data["mesh_vertices"]]
+        positions = [pos.to(self.device) for pos in batch_data["gnn_vertices"]]
+        octree = batch_data["octree"].to(self.device)
+        data = self.input_feature(octree)
         offsets = torch.tensor([0] + [pos.size(0) for pos in positions[:-1]], dtype=torch.long, device=self.device).cumsum(0)
         num_impacts = batch_data["num_impacts"].to(self.device)
-        hit_indices = torch.cat([
-            impact_vertex_index.to(self.device).long() + offset
-            for impact_vertex_index, offset in zip(batch_data["impact_vertex_index"], offsets)
-        ])  # hit_indices: [Q_total]
-        #targets = torch.cat([mel.float().to(self.device).mean(dim=-1) for mel in batch_data["mel_spectrogram"]], dim=0)
+        hit_face_indices = torch.cat([
+            gnn_face_index.to(self.device).long() + offset
+            for gnn_face_index, offset in zip(batch_data["gnn_face_index"], offsets)
+        ], dim=0)
+        hit_barycentric = torch.cat([weights.to(self.device) for weights in batch_data["gnn_barycentric"]], dim=0)
         targets = torch.cat([mel.float().to(self.device).max(dim=-1).values for mel in batch_data["mel_spectrogram"]], dim=0)
-        targets = F.adaptive_avg_pool1d(targets.unsqueeze(1), self.output_dim).squeeze(1)  # 维度转换：将可能200+的mel谱图压缩至 self.output_dim 维
-        batch_data = Batch.from_data_list([Data(pos=pos, x=pos) for pos in positions])
-        batch_data.hit_idx = hit_indices
-        batch_data.y = targets
-
-        # 1. 逐顶点特征计算 (E_vertices)
-        vertex_features = self.gnn(batch_data)   # vertex_features: [V_total, hidden_dim]
-        
-        # 2. 提取全局共振基底 (E_global)
-        # 对顶点维度进行全局最大池化，提取物体拓扑和固有频率字典
-        global_features = global_max_pool(vertex_features, batch_data.batch)
-        global_features = torch.repeat_interleave(global_features, num_impacts, dim=0)   # global_features: [Q_total, hidden_dim]
-        
-        # 3. 离散提取局部激振特征 (E_hit)
-        # 以 O(1) 的时间复杂度进行数组切片，获取专属特征，摒弃复杂的空间插值
-        hit_features = vertex_features[hit_indices]
-        
-        # 4. 特征调制与声学读出
-        # 局部激振特征作为条件，调制全局共振基底，并回归至目标 64 维声音特征
+        targets = F.adaptive_avg_pool1d(targets.unsqueeze(1), self.output_dim).squeeze(1)
+        query_batch_index = torch.cat(
+            [torch.full((pos.size(0),), idx, dtype=torch.long, device=self.device) for idx, pos in enumerate(positions)],
+            dim=0,
+        )
+        query_pts = torch.cat(
+            [torch.cat([pos, batch_idx[:, None].float()], dim=1) for pos, batch_idx in zip(positions, query_batch_index.split([pos.size(0) for pos in positions]))],
+            dim=0,
+        )
+        vertex_features = self.backbone_network(data=data, octree=octree, depth=octree.depth, query_pts=query_pts)
+        global_features = global_max_pool(vertex_features, query_batch_index)
+        global_features = torch.repeat_interleave(global_features, num_impacts, dim=0)
+        hit_features = (vertex_features[hit_face_indices] * hit_barycentric.unsqueeze(-1)).sum(dim=1)
         output = self.decoder(global_features, hit_features)
         loss = F.smooth_l1_loss(output, targets)
         return loss, output

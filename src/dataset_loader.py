@@ -6,7 +6,9 @@ import numpy as np
 import scipy.io.wavfile as wavfile
 import torch
 import torchaudio
+import trimesh
 import torchvision.transforms as T
+from ocnn.octree import Octree, Points, merge_octrees, merge_points
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
@@ -183,10 +185,9 @@ from config.config import cfg
 
 
 class VVImpactDataset(Dataset):
-    def __init__(self, data_dir=None, sample_rate=16000, n_mels=64, transform_image=None, train_only=False):
+    def __init__(self, data_dir=None, sample_rate=16000, transform_image=None, train_only=False):
         self.data_dir = self.resolve_data_dir(data_dir or cfg.DATA_DIR)
         self.sample_rate = sample_rate
-        self.n_mels = n_mels
         self.train_only = train_only
         self.preview_transform = transform_image or T.Compose([
             T.Resize((224, 224)),
@@ -195,25 +196,31 @@ class VVImpactDataset(Dataset):
         self.spec_transform = T.ToTensor()
         self.samples = []
         self.mesh_cache = {}
+        self.remesh_cache = {}
+        self.interp_cache = {}
+        self.octree_cache = {}
         self.resampler_cache = {}
 
         specs_dir = os.path.join(self.data_dir, "impact_specs")
         audio_dir = os.path.join(self.data_dir, "impact_audio")
         msh_dir = os.path.join(self.data_dir, "msh")
-        if not os.path.isdir(specs_dir) or not os.path.isdir(audio_dir) or not os.path.isdir(msh_dir):
+        remesh_dir = os.path.join(self.data_dir, "remesh")
+        if not os.path.isdir(specs_dir) or not os.path.isdir(audio_dir) or not os.path.isdir(msh_dir) or not os.path.isdir(remesh_dir):
             return
 
         for group in sorted(os.listdir(specs_dir)):
             group_specs_dir = os.path.join(specs_dir, group)
             group_audio_dir = os.path.join(audio_dir, group)
             group_msh_dir = os.path.join(msh_dir, group)
-            if not os.path.isdir(group_specs_dir) or not os.path.isdir(group_audio_dir) or not os.path.isdir(group_msh_dir):
+            group_remesh_dir = os.path.join(remesh_dir, group)
+            if not os.path.isdir(group_specs_dir) or not os.path.isdir(group_audio_dir) or not os.path.isdir(group_msh_dir) or not os.path.isdir(group_remesh_dir):
                 continue
             for obj_id in sorted(os.listdir(group_specs_dir)):
                 obj_specs_dir = os.path.join(group_specs_dir, obj_id)
                 obj_audio_dir = os.path.join(group_audio_dir, obj_id)
                 msh_path = os.path.join(group_msh_dir, f"{obj_id}.obj_.msh")
-                if not os.path.isdir(obj_specs_dir) or not os.path.isdir(obj_audio_dir) or not os.path.exists(msh_path):
+                remesh_path = os.path.join(group_remesh_dir, f"{obj_id}.obj")
+                if not os.path.isdir(obj_specs_dir) or not os.path.isdir(obj_audio_dir) or not os.path.exists(msh_path) or not os.path.exists(remesh_path):
                     continue
                 impacts = []
                 for spec_name in sorted(os.listdir(obj_specs_dir)):
@@ -233,6 +240,7 @@ class VVImpactDataset(Dataset):
                         "group": group,
                         "obj_id": obj_id,
                         "msh_path": msh_path,
+                        "remesh_path": remesh_path,
                         "samples": impacts,
                     })
 
@@ -260,6 +268,50 @@ class VVImpactDataset(Dataset):
             self.mesh_cache[msh_path] = mesh
         return mesh
 
+    def load_remesh(self, remesh_path):
+        remesh = self.remesh_cache.get(remesh_path)
+        if remesh is None:
+            obj = trimesh.load(remesh_path, force="mesh", process=False)
+            remesh = {
+                "mesh": obj,
+                "vertices": torch.tensor(obj.vertices, dtype=torch.float32),
+                "faces": torch.tensor(obj.faces, dtype=torch.long),
+                "normals": torch.tensor(obj.vertex_normals, dtype=torch.float32),
+            }
+            self.remesh_cache[remesh_path] = remesh
+        return remesh
+
+    def load_octree(self, remesh_path):
+        octree_data = self.octree_cache.get(remesh_path)
+        if octree_data is None:
+            remesh = self.load_remesh(remesh_path)
+            points = Points(remesh["vertices"], remesh["normals"])
+            octree = Octree(depth=cfg.OCTREE_DEPTH, full_depth=cfg.OCTREE_FULL_DEPTH)
+            octree.build_octree(points)
+            octree.construct_all_neigh()
+            octree_data = {
+                "points": points,
+                "octree": octree,
+            }
+            self.octree_cache[remesh_path] = octree_data
+        return octree_data
+
+    def load_interpolation(self, msh_path, remesh_path, impact_point):
+        cache_key = (msh_path, remesh_path)
+        cached = self.interp_cache.get(cache_key)
+        if cached is None:
+            remesh = self.load_remesh(remesh_path)
+            closest, _, face_id = trimesh.proximity.closest_point(remesh["mesh"], impact_point.numpy())
+            face_index = remesh["faces"][torch.as_tensor(face_id, dtype=torch.long)]
+            triangles = remesh["vertices"][face_index].numpy()
+            barycentric = trimesh.triangles.points_to_barycentric(triangles, closest)
+            cached = {
+                "gnn_face_index": face_index,
+                "gnn_barycentric": torch.tensor(barycentric, dtype=torch.float32),
+            }
+            self.interp_cache[cache_key] = cached
+        return cached
+
     def load_spec(self, spec_path):
         spec_image = Image.open(spec_path).convert("L")
         spec_tensor = self.spec_transform(spec_image).squeeze(0)
@@ -286,6 +338,8 @@ class VVImpactDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         mesh = self.load_mesh(sample["msh_path"])
+        remesh = self.load_remesh(sample["remesh_path"])
+        octree_data = self.load_octree(sample["remesh_path"])
         impact_specs = []
         impact_vertex_index = []
         if not self.train_only:
@@ -306,17 +360,25 @@ class VVImpactDataset(Dataset):
 
         impact_vertex_index = torch.tensor(impact_vertex_index, dtype=torch.long)
         impact_point = mesh["vertices"][impact_vertex_index]
+        interpolation = self.load_interpolation(sample["msh_path"], sample["remesh_path"], impact_point)
         mel_spectrogram = torch.stack(impact_specs)
         data = {
             "mel_spectrogram": mel_spectrogram,
             "mesh_vertices": mesh["vertices"],
             "mesh_tetra": mesh["tetra"],
             "mesh": {"vertices": mesh["vertices"], "tetra": mesh["tetra"]},
+            "gnn_vertices": remesh["vertices"],
+            "gnn_face_index": interpolation["gnn_face_index"],
+            "gnn_barycentric": interpolation["gnn_barycentric"],
+            "gnn_normals": remesh["normals"],
+            "octree_points": octree_data["points"],
+            "octree": octree_data["octree"],
             "impact_point": impact_point,
             "impact_vertex_index": impact_vertex_index,
             "num_impacts": torch.tensor(impact_vertex_index.numel(), dtype=torch.long),
             "mesh_path": sample["msh_path"],
             "msh_path": sample["msh_path"],
+            "remesh_path": sample["remesh_path"],
             "obj_id": sample["obj_id"],
             "group": sample["group"],
             "vertex_id": impact_vertex_index.clone(),
@@ -337,15 +399,23 @@ def collate_vvimpact_batch(batch):
         "mesh_vertices": [item["mesh_vertices"] for item in batch],
         "mesh_tetra": [item["mesh_tetra"] for item in batch],
         "mesh": [item["mesh"] for item in batch],
+        "gnn_vertices": [item["gnn_vertices"] for item in batch],
+        "gnn_face_index": [item["gnn_face_index"] for item in batch],
+        "gnn_barycentric": [item["gnn_barycentric"] for item in batch],
+        "gnn_normals": [item["gnn_normals"] for item in batch],
+        "octree_points": merge_points([item["octree_points"] for item in batch]),
+        "octree": merge_octrees([item["octree"] for item in batch]),
         "impact_point": [item["impact_point"] for item in batch],
         "impact_vertex_index": [item["impact_vertex_index"] for item in batch],
         "num_impacts": torch.stack([item["num_impacts"] for item in batch]),
         "mesh_path": [item["mesh_path"] for item in batch],
         "msh_path": [item["msh_path"] for item in batch],
+        "remesh_path": [item["remesh_path"] for item in batch],
         "obj_id": [item["obj_id"] for item in batch],
         "group": [item["group"] for item in batch],
         "vertex_id": [item["vertex_id"] for item in batch],
     }
+    collated["octree"].construct_all_neigh()
     if "impact_image" in batch[0]:
         collated["impact_image"] = [item["impact_image"] for item in batch]
         collated["waveform"] = [item["waveform"] for item in batch]

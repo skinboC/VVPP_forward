@@ -30,7 +30,6 @@ def main():
     dataset = VVImpactDataset(
         data_dir=cfg.DATA_DIR,
         sample_rate=cfg.SAMPLE_RATE,
-        n_mels=cfg.N_MELS,
         train_only=True,
     )
     

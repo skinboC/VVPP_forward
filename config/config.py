@@ -20,19 +20,21 @@ class Config:
     # DataLoader worker 数量
     NUM_WORKERS = 4
 
-    # 输入特征维度
-    INPUT_DIM = 64
     # 隐藏层特征维度
-    HIDDEN_DIM = 128
+    HIDDEN_DIM = 256
     # 输出特征维度
-    OUTPUT_DIM = 64
+    OUTPUT_DIM = 256
 
-    # Mel 频率 bin 数量
-    N_MELS = 256
     # 音频采样率
     SAMPLE_RATE = 16000
     # 拉普拉斯特征模态数量
     N_EIGENMODES = 64
+    # 八叉树最大深度
+    OCTREE_DEPTH = 6
+    # 八叉树完整展开深度
+    OCTREE_FULL_DEPTH = 4
+    # 八叉树是否仅保留非空节点
+    OCTREE_NEMPTY = False
 
 
 cfg = Config()
