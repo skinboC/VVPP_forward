@@ -1,6 +1,8 @@
 import os
 import sys
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -105,7 +107,77 @@ class MyPipeline(pl.LightningModule):
             num_blocks=4
         )
 
-    def forward(self, batch_data, return_targets=False):
+    def build_validation_report(self, targets, output, loss):
+        gt = targets.detach().cpu()
+        pred = output.detach().cpu()
+        diff = (pred - gt).abs()
+        sample_idx = int(diff.mean(dim=1).argmax().item())
+        gt_sample = gt[sample_idx]
+        pred_sample = pred[sample_idx]
+        diff_sample = diff[sample_idx]
+        sample_count = min(8, gt.size(0))
+        gt_panel = gt[:sample_count]
+        pred_panel = pred[:sample_count]
+        mae = diff.mean().item()
+        rmse = torch.sqrt(((pred - gt) ** 2).mean()).item()
+        corr = torch.corrcoef(torch.stack([gt_sample, pred_sample]))[0, 1].item() if gt_sample.numel() > 1 else 0.0
+        worst_dims = torch.topk(diff_sample, k=min(8, diff_sample.numel())).indices.tolist()
+
+        fig = plt.figure(figsize=(16, 10), dpi=160)
+        gs = fig.add_gridspec(3, 3, height_ratios=[1.1, 1.6, 1.6])
+
+        ax_text = fig.add_subplot(gs[0, :])
+        ax_text.axis("off")
+        text = "\n".join([
+            f"epoch={self.current_epoch}  val_loss={float(loss.item()):.6f}  samples={gt.size(0)}  dims={gt.size(1)}",
+            f"global_mae={mae:.6f}  global_rmse={rmse:.6f}  sample_idx={sample_idx}  sample_corr={corr:.6f}",
+            f"gt(mean/std/min/max)=({gt_sample.mean():.4f}, {gt_sample.std():.4f}, {gt_sample.min():.4f}, {gt_sample.max():.4f})",
+            f"pred(mean/std/min/max)=({pred_sample.mean():.4f}, {pred_sample.std():.4f}, {pred_sample.min():.4f}, {pred_sample.max():.4f})",
+            f"worst_dims={worst_dims}",
+        ])
+        ax_text.text(0.01, 0.98, text, va="top", ha="left", family="monospace", fontsize=11)
+
+        ax_line = fig.add_subplot(gs[1, 0])
+        ax_line.plot(gt_sample.numpy(), label="GT", linewidth=2)
+        ax_line.plot(pred_sample.numpy(), label="Pred", linewidth=2)
+        ax_line.set_title("GT vs Pred")
+        ax_line.legend()
+
+        ax_diff = fig.add_subplot(gs[1, 1])
+        ax_diff.bar(range(diff_sample.numel()), diff_sample.numpy(), color="tab:red")
+        ax_diff.set_title("Absolute Error")
+
+        ax_scatter = fig.add_subplot(gs[1, 2])
+        ax_scatter.scatter(gt_sample.numpy(), pred_sample.numpy(), s=18, alpha=0.8)
+        lo = min(gt_sample.min().item(), pred_sample.min().item())
+        hi = max(gt_sample.max().item(), pred_sample.max().item())
+        ax_scatter.plot([lo, hi], [lo, hi], color="black", linewidth=1)
+        ax_scatter.set_title("GT-Pred Scatter")
+        ax_scatter.set_xlabel("GT")
+        ax_scatter.set_ylabel("Pred")
+
+        ax_gt = fig.add_subplot(gs[2, 0])
+        im_gt = ax_gt.imshow(gt_panel.numpy(), aspect="auto", cmap="viridis")
+        ax_gt.set_title("GT Heatmap")
+        fig.colorbar(im_gt, ax=ax_gt, fraction=0.046, pad=0.04)
+
+        ax_pred = fig.add_subplot(gs[2, 1])
+        im_pred = ax_pred.imshow(pred_panel.numpy(), aspect="auto", cmap="viridis")
+        ax_pred.set_title("Pred Heatmap")
+        fig.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
+
+        ax_err = fig.add_subplot(gs[2, 2])
+        im_err = ax_err.imshow((pred_panel - gt_panel).abs().numpy(), aspect="auto", cmap="magma")
+        ax_err.set_title("AbsDiff Heatmap")
+        fig.colorbar(im_err, ax=ax_err, fraction=0.046, pad=0.04)
+
+        fig.tight_layout()
+        fig.canvas.draw()
+        image = torch.from_numpy(np.asarray(fig.canvas.buffer_rgba()).copy()[..., :3]).permute(2, 0, 1)
+        plt.close(fig)
+        return image
+
+    def forward(self, batch_data):
         """
         前向推理函数：将输入 3D 网格和敲击点转化为声音特征向量
         """
@@ -118,7 +190,7 @@ class MyPipeline(pl.LightningModule):
         ])  # hit_indices: [Q_total]
         #targets = torch.cat([mel.float().to(self.device).mean(dim=-1) for mel in batch_data["mel_spectrogram"]], dim=0)
         targets = torch.cat([mel.float().to(self.device).max(dim=-1).values for mel in batch_data["mel_spectrogram"]], dim=0)
-        targets = F.adaptive_avg_pool1d(targets.unsqueeze(1), self.output_dim).squeeze(1)
+        targets = F.adaptive_avg_pool1d(targets.unsqueeze(1), self.output_dim).squeeze(1)  # 维度转换：将可能200+的mel谱图压缩至 self.output_dim 维
         batch_data = Batch.from_data_list([Data(pos=pos, x=pos) for pos in positions])
         batch_data.hit_idx = hit_indices
         batch_data.y = targets
@@ -138,39 +210,28 @@ class MyPipeline(pl.LightningModule):
         # 4. 特征调制与声学读出
         # 局部激振特征作为条件，调制全局共振基底，并回归至目标 64 维声音特征
         output = self.decoder(global_features, hit_features)
-
-        if return_targets:
-            return output, targets
-
-        return output
-
-    def compute_loss(self, batch_data, stage):
-        """
-        前向传播并计算损失 (Huber Loss / Smooth L1 Loss)
-        """
-        predictions, targets = self(batch_data, return_targets=True)
-        
-        # 根据 markdown 文档，采用 MSE 或 Huber Loss (Smooth L1) 对离群点更鲁棒
-        loss = F.smooth_l1_loss(predictions, targets)
-        
-        self.log(
-            f"{stage}_loss",
-            loss,
-            on_step=(stage == "train"),
-            on_epoch=True,
-            prog_bar=True,
-            batch_size=targets.size(0) if targets.dim() > 0 else 1,
-        )
-        return loss
+        loss = F.smooth_l1_loss(output, targets)
+        return loss, output
 
     def training_step(self, batch, batch_idx):
-        return self.compute_loss(batch, "train")
+        loss, _ = self(batch)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        return self.compute_loss(batch, "val")
+        loss, output = self(batch)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
+        if batch_idx == 0 and getattr(self.logger, "experiment", None) is not None:
+            targets = torch.cat([mel.float().to(self.device).max(dim=-1).values for mel in batch["mel_spectrogram"]], dim=0)
+            targets = F.adaptive_avg_pool1d(targets.unsqueeze(1), self.output_dim).squeeze(1)
+            report = self.build_validation_report(targets, output, loss)
+            self.logger.experiment.add_image("val/gt_pred_absdiff", report, self.current_epoch)
+        return loss
 
     def test_step(self, batch, batch_idx):
-        return self.compute_loss(batch, "test")
+        loss, _ = self(batch)
+        self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
+        return loss
 
     def configure_optimizers(self):
         """

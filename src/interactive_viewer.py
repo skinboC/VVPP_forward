@@ -149,7 +149,7 @@ class PolyscopeViewer:
 
 
 if __name__ == "__main__":
-    dataset = VVImpactDataset()
+    dataset = VVImpactDataset(train_only=False)
     if len(dataset) > 0:
         viewer = PolyscopeViewer(dataset)
         viewer.run()

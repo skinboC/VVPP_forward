@@ -1,7 +1,9 @@
 import os
 import sys
 import pytorch_lightning as pl
+import torch
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader, random_split
 
 # Add project root to sys.path
@@ -12,6 +14,7 @@ if project_root not in sys.path:
 from config.config import cfg
 from src.pipeline import MyPipeline
 from src.dataset_loader import VVImpactDataset, collate_vvimpact_batch
+
 
 def main():
     print("="*50)
@@ -28,6 +31,7 @@ def main():
         data_dir=cfg.DATA_DIR,
         sample_rate=cfg.SAMPLE_RATE,
         n_mels=cfg.N_MELS,
+        train_only=True,
     )
     
     if len(dataset) == 0:
@@ -69,7 +73,7 @@ def main():
         dirpath=os.path.join(project_root, "checkpoints"),
         filename="best-checkpoint-{epoch:02d}-{val_loss:.4f}",
         save_top_k=1,
-        verbose=True,
+        verbose=False,
         monitor="val_loss",
         mode="min"
     )
@@ -78,19 +82,34 @@ def main():
     early_stop_callback = EarlyStopping(
         monitor="val_loss",
         patience=10,
-        verbose=True,
+        verbose=False,
         mode="min"
     )
     
-    # 5. Initialize Trainer
-    # Since torch-cluster's fps op fails on MPS (Mac GPU) and only works on CPU/CUDA,
-    # we explicitly set accelerator="cpu" for now to avoid the RuntimeError.
+    accelerator = cfg.DEVICE.lower()
+    devices = cfg.DEVICES
+    if accelerator == "cuda" and not torch.cuda.is_available():
+        accelerator = "cpu"
+        devices = 1
+    if accelerator == "mps" and not torch.backends.mps.is_available():
+        accelerator = "cpu"
+        devices = 1
+
+    tensorboard_logger = TensorBoardLogger(
+        save_dir=os.path.join(project_root, "logs"),
+        name="tensorboard",
+    )
+
     trainer = pl.Trainer(
         max_epochs=cfg.MAX_EPOCHS, 
         callbacks=[checkpoint_callback, early_stop_callback],
-        accelerator="cpu",  # Force CPU to avoid torch-cluster MPS bugs
-        devices=1,
-        log_every_n_steps=1, # Adjust this based on your dataset size
+        accelerator=accelerator,
+        devices=devices,
+        log_every_n_steps=1,
+        logger=tensorboard_logger,
+        enable_progress_bar=True,
+        enable_model_summary=False,
+        num_sanity_val_steps=0,
         default_root_dir=os.path.join(project_root, "logs")
     )
     

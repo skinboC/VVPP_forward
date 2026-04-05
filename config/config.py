@@ -1,46 +1,38 @@
 import os
 
 
-def _get_env_value(name, default):
-    raw_value = os.getenv(name)
-    if raw_value is None or raw_value == "":
-        return default
-    if isinstance(default, bool):
-        return raw_value.lower() in {"1", "true", "yes", "on"}
-    if isinstance(default, int) and not isinstance(default, bool):
-        return int(raw_value)
-    if isinstance(default, float):
-        return float(raw_value)
-    return raw_value
-
-
 class Config:
-    # ---------------------------------------------------------
-    # Global Hyperparameters
-    # ---------------------------------------------------------
-    
-    # Training Parameters
-    LEARNING_RATE = _get_env_value("VV_LEARNING_RATE", 1e-3)
-    BATCH_SIZE = _get_env_value("VV_BATCH_SIZE", 32)
-    MAX_EPOCHS = _get_env_value("VV_MAX_EPOCHS", 100)
-    WEIGHT_DECAY = _get_env_value("VV_WEIGHT_DECAY", 1e-4)
-    
-    # Dataset Parameters
-    DATA_DIR = _get_env_value(
-        "VV_DATA_DIR",
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"),
-    )
-    NUM_WORKERS = _get_env_value("VV_NUM_WORKERS", 4)
-    
-    # Model Architecture Parameters
-    INPUT_DIM = _get_env_value("VV_INPUT_DIM", 64)
-    HIDDEN_DIM = _get_env_value("VV_HIDDEN_DIM", 128)
-    OUTPUT_DIM = _get_env_value("VV_OUTPUT_DIM", 64)
-    
-    # Feature Extraction Parameters
-    N_MELS = _get_env_value("VV_N_MELS", 64)
-    SAMPLE_RATE = _get_env_value("VV_SAMPLE_RATE", 16000)
-    N_EIGENMODES = _get_env_value("VV_N_EIGENMODES", 64)
+    # 优化器学习率
+    LEARNING_RATE = 1e-3
+    # 每个 batch 中包含的 mesh 数量
+    BATCH_SIZE = 2
+    # 最大训练轮数
+    MAX_EPOCHS = 100
+    # 权重衰减系数
+    WEIGHT_DECAY = 1e-4
+    # 训练设备类型，可选 cpu / cuda / mps
+    DEVICE = "cpu"
+    # 使用的设备数量
+    DEVICES = 1
 
-# Create a global instance to be imported
+    # 数据根目录
+    DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "vv++test")
+    # DataLoader worker 数量
+    NUM_WORKERS = 4
+
+    # 输入特征维度
+    INPUT_DIM = 64
+    # 隐藏层特征维度
+    HIDDEN_DIM = 128
+    # 输出特征维度
+    OUTPUT_DIM = 64
+
+    # Mel 频率 bin 数量
+    N_MELS = 256
+    # 音频采样率
+    SAMPLE_RATE = 16000
+    # 拉普拉斯特征模态数量
+    N_EIGENMODES = 64
+
+
 cfg = Config()

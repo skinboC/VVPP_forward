@@ -11,15 +11,183 @@ from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
+from config.config import cfg
 
-VVPP_DATA_DIR = "/Users/bobo/Codes/vv-impact/data/vv++test"
+
+
+"""
+
+这是当前 [VVImpactDataset.__getitem__] 返回的一个“单个 mesh 样本”的字典。  
+也就是说，`raw_data` 不是一个 batch，而是：
+
+- 一个物体 / 一个 `.msh` 体网格
+- 以及这个物体上所有敲击点的全部信息
+
+下面我按字段解释。
+
+**整体约定**
+- 设 `K` = 当前 mesh 上的敲击点数量
+- 设 `V` = 当前 mesh 的顶点数
+- 设 `E` = 当前 `.msh` 中四面体单元数
+- 设 `H, W` = 频谱图 PNG 的高宽
+- 你当前真实样本里大致是：
+  - `K = 200`
+  - `V = 2380`
+  - `E = 7271`
+  - `mel_spectrogram` 约为 `(200, 257, 250)`
+
+**字段说明**
+- `mel_spectrogram`
+  - 形状：`[K, H, W]`，你当前大致是 `[200, 257, 250]`
+  - 含义：当前 mesh 的所有 impact 对应的频谱图张量
+  - 来源：逐个读取 `impact_specs/.../audio_xxx.png`，转灰度后 `ToTensor()`，再去掉通道维 [load_spec](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L83-L87) 和 [__getitem__](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L97-L110)
+  - 说明：这里其实不是从 waveform 现算 mel，而是直接读已经生成好的频谱图 PNG
+
+- `impact_image`
+  - 形状：`[K, 3, 224, 224]`
+  - 含义：同一批 impact 对应的可视化预览图
+  - 来源：同样来自 `impact_specs/.../audio_xxx.png`，但转成 RGB 后再做 `Resize(224,224) + ToTensor()` [dataset_loader.py:L19-L23](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L19-L23) [load_spec](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L83-L87)
+  - 用途：主要给 viewer 展示，不是训练主输入
+
+- `waveform`
+  - 形状：`[K, Lmax]`
+  - 含义：当前 mesh 所有 impact 的音频波形，已做 padding
+  - 来源：逐个读取 `impact_audio/.../audio_xxx.wav`，转 float，必要时重采样到 `sample_rate`，然后 `pad_sequence` 拼成同长度 [load_waveform](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L89-L102) [__getitem__](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L97-L112)
+  - 说明：`Lmax` 是这个 mesh 内所有 impact 里最长的音频长度；你现在样本里大致是 `[200, 16000]`
+
+- `waveform_length`
+  - 形状：`[K]`
+  - 含义：每条 waveform 的真实长度
+  - 来源：在 padding 前统计每条波形长度 [dataset_loader.py:L111-L112](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L111-L112)
+  - 用途：播放音频或做时域模型时裁掉 padding
+
+- `sample_rate`
+  - 形状：标量 `int`
+  - 含义：音频采样率
+  - 来源：数据集初始化参数 `sample_rate`，默认 16000 [dataset_loader.py:L15-L18](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L15-L18)
+  - 用途：播放音频、时域处理
+
+- `mesh_vertices`
+  - 形状：`[V, 3]`
+  - 含义：当前 `.msh` 体网格的全部顶点坐标
+  - 来源：用 `meshio.read(msh_path)` 读取 `.msh` 后取 `msh.points` [load_mesh](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L69-L81)
+  - 用途：这是 [pipeline.py](file:///Users/bobo/Codes/vv-impact/src/pipeline.py#L112-L140) 真正喂给 PointNet++ 的几何输入
+
+- `mesh_tetra`
+  - 形状：`[E, 4]`
+  - 含义：体网格的四面体单元索引
+  - 来源：从 `.msh` 的 `cells_dict["tetra"]` 或 `cells` 中取出 `tetra` [load_mesh](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L72-L79)
+  - 用途：主要给 Polyscope 可视化体网格；当前训练没直接用
+
+- `mesh`
+  - 结构：`{"vertices": mesh_vertices, "tetra": mesh_tetra}`
+  - 含义：把 mesh 再封装成一个字典
+  - 来源：在 `__getitem__` 里直接组装 [dataset_loader.py:L113-L115](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L113-L115)
+  - 用途：便于下游统一传递 mesh 对象
+
+- `impact_point`
+  - 形状：`[K, 3]`
+  - 含义：每个 impact 对应的 3D 敲击点坐标
+  - 来源：用 `mesh["vertices"][impact_vertex_index]` 直接索引得到 [dataset_loader.py:L104-L106](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L104-L106)
+  - 用途：viewer 里显示红色敲击点；也可做几何监督
+
+- `impact_vertex_index`
+  - 形状：`[K]`
+  - 含义：当前 mesh 上所有敲击顶点的索引
+  - 来源：从文件名 `audio_<vertex_id>.png/.wav` 里解析出顶点编号 [dataset_loader.py:L43-L50](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L43-L50) ，然后在 `__getitem__` 里组装成张量 [dataset_loader.py:L104](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L104)
+  - 用途：这是 [pipeline.py](file:///Users/bobo/Codes/vv-impact/src/pipeline.py#L115-L118) 构造 `hit_indices` 的关键字段
+
+- `num_impacts`
+  - 形状：标量张量 `[]`
+  - 含义：当前 mesh 上有多少个 impact
+  - 来源：`impact_vertex_index.numel()` [dataset_loader.py:L117](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L117)
+  - 用途：batch 内把每个 mesh 的 global feature 重复到所有 impact 上时会用到 [pipeline.py:L113-L132](file:///Users/bobo/Codes/vv-impact/src/pipeline.py#L113-L132)
+
+- `mesh_path`
+  - 形状：字符串
+  - 含义：当前 mesh 文件路径
+  - 现在实际内容：就是 `.msh` 路径
+  - 来源：`sample["msh_path"]` [dataset_loader.py:L118-L119](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L118-L119)
+  - 说明：这里名字叫 `mesh_path`，但现在指向的是体网格 `.msh`
+
+- `msh_path`
+  - 形状：字符串
+  - 含义：当前 `.msh` 文件路径
+  - 来源：扫描 `vv++test/msh/<group>/<obj_id>.obj_.msh` 时记录 [dataset_loader.py:L37-L57](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L37-L57)
+  - 说明：和 `mesh_path` 当前是重复信息
+
+- `obj_id`
+  - 形状：字符串
+  - 含义：当前物体 ID
+  - 来源：目录名，比如 `21002` [dataset_loader.py:L37-L57](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L37-L57)
+
+- `group`
+  - 形状：字符串
+  - 含义：上层分组目录，比如 `21`
+  - 来源：扫描 `impact_specs/<group>/<obj_id>` 时得到 [dataset_loader.py:L32-L38](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L32-L38)
+
+- `vertex_id`
+  - 形状：`[K]`
+  - 含义：本质上和 `impact_vertex_index` 一样，是同一组顶点编号
+  - 来源：`impact_vertex_index.clone()` [dataset_loader.py:L120-L123](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L120-L123)
+  - 说明：这是保留一份更贴近原始命名的副本
+
+- `impact_spec_path`
+  - 形状：长度为 `K` 的字符串列表
+  - 含义：每个 impact 对应的频谱图路径
+  - 来源：扫描 `impact_specs` 时保存 [dataset_loader.py:L47-L50](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L47-L50) ，在 `__getitem__` 里收集 [dataset_loader.py:L95-L103](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L95-L103)
+  - 用途：调试、追溯样本来源
+
+- `impact_audio_path`
+  - 形状：长度为 `K` 的字符串列表
+  - 含义：每个 impact 对应的 wav 路径
+  - 来源：扫描 `impact_audio` 时构造 [dataset_loader.py:L46-L50](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L46-L50) ，在 `__getitem__` 里收集 [dataset_loader.py:L95-L103](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L95-L103)
+  - 用途：viewer 播放声音、调试音频来源
+
+**这些数据是怎么组织出来的**
+- 第一步：扫描目录，构建“一个 mesh 对应一组 impacts”的样本列表 [VVImpactDataset.__init__](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L14-L57)
+  - `impact_specs/<group>/<obj_id>/audio_xxx.png`
+  - `impact_audio/<group>/<obj_id>/audio_xxx.wav`
+  - `msh/<group>/<obj_id>.obj_.msh`
+- 第二步：读取 `.msh` 得到体网格 [load_mesh](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L69-L81)
+- 第三步：对该 mesh 的每个 impact：
+  - 读 PNG 频谱图 [load_spec](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L83-L87)
+  - 读 WAV 波形 [load_waveform](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L89-L102)
+- 第四步：在 [__getitem__](file:///Users/bobo/Codes/vv-impact/src/dataset_loader.py#L104-L124) 里把这些 impact 信息聚合成一个 mesh 级样本
+
+**和 pipeline 的关系**
+当前 [forward](file:///Users/bobo/Codes/vv-impact/src/pipeline.py#L108-L145) 真正用到的主要是：
+- `mesh_vertices`
+- `impact_vertex_index`
+- `num_impacts`
+- `mel_spectrogram`
+
+其中：
+- `mesh_vertices` → 几何输入
+- `impact_vertex_index` → 敲击点位置
+- `mel_spectrogram` → 构造监督目标 `targets`
+- `num_impacts` → 把每个 mesh 的全局特征扩展到所有 impact
+
+而这些字段：
+- `impact_image`
+- `waveform`
+- `waveform_length`
+- `mesh_tetra`
+- `impact_point`
+- `impact_spec_path`
+- `impact_audio_path`
+
+主要是给 [interactive_viewer.py] 做验证性可视化和音频播放用的。
+
+"""
 
 
 class VVImpactDataset(Dataset):
-    def __init__(self, data_dir=VVPP_DATA_DIR, sample_rate=16000, n_mels=64, transform_image=None):
-        self.data_dir = self.resolve_data_dir(data_dir)
+    def __init__(self, data_dir=None, sample_rate=16000, n_mels=64, transform_image=None, train_only=False):
+        self.data_dir = self.resolve_data_dir(data_dir or cfg.DATA_DIR)
         self.sample_rate = sample_rate
         self.n_mels = n_mels
+        self.train_only = train_only
         self.preview_transform = transform_image or T.Compose([
             T.Resize((224, 224)),
             T.ToTensor(),
@@ -69,11 +237,11 @@ class VVImpactDataset(Dataset):
                     })
 
     def resolve_data_dir(self, data_dir):
-        candidates = [data_dir, os.path.join(data_dir, "vv++test"), VVPP_DATA_DIR]
+        candidates = [data_dir, os.path.join(data_dir, "vv++test")]
         for candidate in candidates:
             if candidate and os.path.isdir(os.path.join(candidate, "impact_specs")) and os.path.isdir(os.path.join(candidate, "msh")):
                 return candidate
-        return VVPP_DATA_DIR
+        return data_dir
 
     def __len__(self):
         return len(self.samples)
@@ -119,34 +287,28 @@ class VVImpactDataset(Dataset):
         sample = self.samples[idx]
         mesh = self.load_mesh(sample["msh_path"])
         impact_specs = []
-        impact_images = []
-        waveforms = []
         impact_vertex_index = []
-        impact_spec_path = []
-        impact_audio_path = []
+        if not self.train_only:
+            impact_images = []
+            waveforms = []
+            impact_spec_path = []
+            impact_audio_path = []
 
         for impact in sample["samples"]:
             spec_tensor, preview_tensor = self.load_spec(impact["spec_path"])
             impact_specs.append(spec_tensor)
-            impact_images.append(preview_tensor)
-            waveforms.append(self.load_waveform(impact["wav_path"]))
             impact_vertex_index.append(impact["vertex_id"])
-            impact_spec_path.append(impact["spec_path"])
-            impact_audio_path.append(impact["wav_path"])
+            if not self.train_only:
+                impact_images.append(preview_tensor)
+                waveforms.append(self.load_waveform(impact["wav_path"]))
+                impact_spec_path.append(impact["spec_path"])
+                impact_audio_path.append(impact["wav_path"])
 
         impact_vertex_index = torch.tensor(impact_vertex_index, dtype=torch.long)
         impact_point = mesh["vertices"][impact_vertex_index]
         mel_spectrogram = torch.stack(impact_specs)
-        impact_image = torch.stack(impact_images)
-        waveform = pad_sequence(waveforms, batch_first=True)
-        waveform_length = torch.tensor([wave.size(0) for wave in waveforms], dtype=torch.long)
-
-        return {
+        data = {
             "mel_spectrogram": mel_spectrogram,
-            "impact_image": impact_image,
-            "waveform": waveform,
-            "waveform_length": waveform_length,
-            "sample_rate": self.sample_rate,
             "mesh_vertices": mesh["vertices"],
             "mesh_tetra": mesh["tetra"],
             "mesh": {"vertices": mesh["vertices"], "tetra": mesh["tetra"]},
@@ -158,18 +320,20 @@ class VVImpactDataset(Dataset):
             "obj_id": sample["obj_id"],
             "group": sample["group"],
             "vertex_id": impact_vertex_index.clone(),
-            "impact_spec_path": impact_spec_path,
-            "impact_audio_path": impact_audio_path,
         }
+        if not self.train_only:
+            data["impact_image"] = torch.stack(impact_images)
+            data["waveform"] = pad_sequence(waveforms, batch_first=True)
+            data["waveform_length"] = torch.tensor([wave.size(0) for wave in waveforms], dtype=torch.long)
+            data["sample_rate"] = self.sample_rate
+            data["impact_spec_path"] = impact_spec_path
+            data["impact_audio_path"] = impact_audio_path
+        return data
 
 
 def collate_vvimpact_batch(batch):
-    return {
+    collated = {
         "mel_spectrogram": [item["mel_spectrogram"] for item in batch],
-        "impact_image": [item["impact_image"] for item in batch],
-        "waveform": [item["waveform"] for item in batch],
-        "waveform_length": [item["waveform_length"] for item in batch],
-        "sample_rate": batch[0]["sample_rate"],
         "mesh_vertices": [item["mesh_vertices"] for item in batch],
         "mesh_tetra": [item["mesh_tetra"] for item in batch],
         "mesh": [item["mesh"] for item in batch],
@@ -181,9 +345,15 @@ def collate_vvimpact_batch(batch):
         "obj_id": [item["obj_id"] for item in batch],
         "group": [item["group"] for item in batch],
         "vertex_id": [item["vertex_id"] for item in batch],
-        "impact_spec_path": [item["impact_spec_path"] for item in batch],
-        "impact_audio_path": [item["impact_audio_path"] for item in batch],
     }
+    if "impact_image" in batch[0]:
+        collated["impact_image"] = [item["impact_image"] for item in batch]
+        collated["waveform"] = [item["waveform"] for item in batch]
+        collated["waveform_length"] = [item["waveform_length"] for item in batch]
+        collated["sample_rate"] = batch[0]["sample_rate"]
+        collated["impact_spec_path"] = [item["impact_spec_path"] for item in batch]
+        collated["impact_audio_path"] = [item["impact_audio_path"] for item in batch]
+    return collated
 
 
 def visualize_sample(batch, save_path="sample_visualization.png"):
