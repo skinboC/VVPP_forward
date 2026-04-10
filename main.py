@@ -1,5 +1,6 @@
 import math
 import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import sys
 import pytorch_lightning as pl
 import torch
@@ -63,6 +64,7 @@ def main():
         data_dir=cfg.DATA_DIR,
         sample_rate=cfg.SAMPLE_RATE,
         train_only=True,
+        obj_limit=cfg.OBJ_LIMIT,
     )
     
     if len(dataset) == 0:

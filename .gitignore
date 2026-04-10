@@ -35,3 +35,4 @@ data/*
 
 .polyscope.ini
 imgui.ini
+logs

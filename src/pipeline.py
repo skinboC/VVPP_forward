@@ -20,12 +20,13 @@ import src.models.ocnn_model_ref.my_ocnn as ocnn_unet
 
 
 class AcousticFieldHead(nn.Module):
-    def __init__(self, hidden_dim, output_dim, pe_frequencies=6, attention_heads=4, num_peaks=12):
+    def __init__(self, hidden_dim, output_dim, pe_frequencies=6, attention_heads=4, num_peaks=12, use_modal_bins=True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.pe_frequencies = pe_frequencies
         self.num_peaks = num_peaks
+        self.use_modal_bins = use_modal_bins
         self.register_buffer(
             "frequency_bands",
             (2.0 ** torch.arange(pe_frequencies, dtype=torch.float32)) * torch.pi,
@@ -74,6 +75,16 @@ class AcousticFieldHead(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, num_peaks * 4),
+        )
+        
+        # 4. 模态锚点方案 (Modal Anchor) - 在 64 个区间预测 (prob, offset, amp)
+        self.num_modal_bins = 64
+        self.predictor_modal_anchor = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.num_modal_bins * 3),
         )
 
     def positional_encoding(self, xyz):
@@ -140,6 +151,54 @@ class AcousticFieldHead(nn.Module):
         anchors = torch.stack([base_val, freqs, amps, widths], dim=-1)
         return rendered, anchors
 
+    def render_modal_spectrum(self, prob, freqs, amps):
+        """将预测的模态参数渲染回连续频谱。使用极小的固定宽度以保证可导性，并结合概率 prob 控制激活"""
+        x = torch.linspace(0, 1, self.output_dim, device=freqs.device).view(1, 1, self.output_dim)
+        
+        freqs = freqs.unsqueeze(-1)
+        amps = amps.unsqueeze(-1)
+        prob = prob.unsqueeze(-1)
+        
+        # 使用极小的固定宽度（例如一个输出像素的宽度），保证梯度平滑传递
+        fixed_width = 1.0 / self.output_dim
+        
+        # 有效振幅 = 存在概率 * 原始振幅
+        effective_amps = prob * amps
+        
+        gaussians = effective_amps * torch.exp(-0.5 * ((x - freqs) / fixed_width) ** 2)
+        spectrum = gaussians.sum(dim=1)
+        
+        return spectrum
+
+    def forward_modal_anchor(self, features):
+        out = self.predictor_modal_anchor(features).view(-1, self.num_modal_bins, 3)
+        
+        # prob: 存在概率，限制在 [0, 1]
+        prob = torch.sigmoid(out[..., 0])
+        # amp: 振幅
+        amps = F.softplus(out[..., 2])
+        
+        if self.use_modal_bins:
+            # 方案一：强行划分区间 (Fixed Bins)
+            # offset: 在 bin 内部的相对偏移，限制在 [0, 1]
+            offset = torch.sigmoid(out[..., 1])
+            # 计算绝对频率
+            bin_centers = (torch.arange(self.num_modal_bins, device=features.device).float() + 0.5) / self.num_modal_bins
+            freqs = bin_centers.unsqueeze(0) + (offset - 0.5) / self.num_modal_bins
+            freqs = freqs.clamp(0, 1)
+        else:
+            # 路线 B：无匹配的集合预测 (Free Continuous Set Prediction)
+            # 不划分区间，直接把预测值当作全局的绝对频率，用 sigmoid 限制在 [0, 1] 之间
+            freqs = torch.sigmoid(out[..., 1])
+        
+        # 渲染频谱
+        rendered = self.render_modal_spectrum(prob, freqs, amps)
+        
+        # 将 prob, freqs, amps 打包作为锚点输出，供后续计算辅助 loss 或可视化使用
+        anchors = torch.stack([prob, freqs, amps], dim=-1)
+        
+        return rendered, anchors
+
     def forward(self, point_features, global_features, xyz, mode="direct"):
         local_token = self.local_encoder(torch.cat([point_features, self.positional_encoding(xyz)], dim=-1))
         global_token = self.global_encoder(global_features)
@@ -157,6 +216,8 @@ class AcousticFieldHead(nn.Module):
             return self.forward_bipartite(features)
         elif mode == "anchor":
             return self.forward_anchor(features)
+        elif mode == "modal_anchor":
+            return self.forward_modal_anchor(features)
         else:
             return self.forward_direct(features)
 
@@ -164,8 +225,11 @@ class AcousticFieldHead(nn.Module):
 class MyPipeline(pl.LightningModule):
     def __init__(self, learning_rate=None):
         super().__init__()
-        # 读取配置，决定使用哪种预测模式："direct", "bipartite", "anchor"
+        # 读取配置，决定使用哪种预测模式："direct", "bipartite", "anchor", "modal_anchor"
         self.prediction_mode = getattr(cfg, "PREDICTION_MODE", "direct")
+        self.use_modal_bins = getattr(cfg, "USE_MODAL_BINS", True)  # 新增开关，默认True(使用方案一)
+        self.sparse_penalty_weight = getattr(cfg, "SPARSE_PENALTY_WEIGHT", 0.01)  # 稀疏损失权重
+        
         self.learning_rate = learning_rate if learning_rate is not None else getattr(cfg, "LEARNING_RATE", 1e-3)
         self.hidden_dim = getattr(cfg, "HIDDEN_DIM", 256)
         self.output_dim = getattr(cfg, "OUTPUT_DIM", 256)
@@ -178,6 +242,7 @@ class MyPipeline(pl.LightningModule):
             self.output_dim,
             attention_heads=max(1, int(getattr(cfg, "HEAD_ATTENTION_HEADS", 4))),
             num_peaks=12,
+            use_modal_bins=self.use_modal_bins,
         )
 
     def build_targets(self, batch_data):
@@ -208,10 +273,18 @@ class MyPipeline(pl.LightningModule):
         target_energy = targets.sum(dim=-1)
         energy_loss = F.l1_loss(pred_energy, target_energy)
         
-        total_loss = smooth_l1_loss * 10.0 + emd_loss * 1.0 + energy_loss * 1.0
+        total_loss = smooth_l1_loss * 10.0 + emd_loss * 1.0 + energy_loss * 0.1
         mode_loss = torch.tensor(0.0, device=self.device)
+        
+        # 4. 模态稀疏惩罚 (针对 modal_anchor 方案及无匹配集合预测方案)
+        if self.prediction_mode == "modal_anchor" and aux_data is not None:
+            # aux_data 为 anchors: [..., prob, freqs, amps]
+            prob = aux_data[..., 0]
+            # 施加 L1 稀疏惩罚，强迫网络用尽量少的模态，抑制无效的 prob
+            mode_loss = prob.mean()
+            total_loss = total_loss + mode_loss * self.sparse_penalty_weight
                 
-        return total_loss, smooth_l1_loss, emd_loss, mode_loss
+        return total_loss, smooth_l1_loss, emd_loss, mode_loss, energy_loss
 
     def select_global_context_points(self, vertices):
         if vertices.size(0) <= self.global_context_points:
@@ -306,17 +379,17 @@ class MyPipeline(pl.LightningModule):
         vmax = max(gt_panel.max().item(), pred_panel.max().item())
 
         ax_gt = fig.add_subplot(gs[2, 0])
-        im_gt = ax_gt.imshow(gt_panel.numpy(), aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
+        im_gt = ax_gt.imshow(gt_panel.numpy().T, aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
         ax_gt.set_title("GT Heatmap")
         fig.colorbar(im_gt, ax=ax_gt, fraction=0.046, pad=0.04)
 
         ax_pred = fig.add_subplot(gs[2, 1])
-        im_pred = ax_pred.imshow(pred_panel.numpy(), aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
+        im_pred = ax_pred.imshow(pred_panel.numpy().T, aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
         ax_pred.set_title("Pred Heatmap")
         fig.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
 
         ax_err = fig.add_subplot(gs[2, 2])
-        im_err = ax_err.imshow((pred_panel - gt_panel).abs().numpy(), aspect="auto", cmap="magma")
+        im_err = ax_err.imshow((pred_panel - gt_panel).abs().numpy().T, aspect="auto", cmap="magma")
         ax_err.set_title("AbsDiff Heatmap")
         fig.colorbar(im_err, ax=ax_err, fraction=0.046, pad=0.04)
 
@@ -334,13 +407,13 @@ class MyPipeline(pl.LightningModule):
         ]
         octree = batch_data["octree"].to(self.device)
         data = self.input_feature(octree)
-        targets = self.build_targets(batch_data)
+        targets = self.build_targets(batch_data) # target: [n_points, n_freqs] 每个频率的能量峰值
         combined_query_groups = [
             torch.cat([impact_point, context_point], dim=0)
             for impact_point, context_point in zip(impact_points, global_context_points)
         ]
         point_xyz, query_pts, _ = self.build_batched_query_points(combined_query_groups)
-        combined_features = self.backbone_network(data=data, octree=octree, depth=octree.depth, query_pts=query_pts)
+        combined_features = self.backbone_network(data=data, octree=octree, depth=octree.depth, query_pts=query_pts) # (n_points, n_features)
         local_feature_groups = []
         global_feature_groups = []
         split_sizes = [points.size(0) for points in combined_query_groups]
@@ -355,7 +428,7 @@ class MyPipeline(pl.LightningModule):
             pooled_context = torch.cat(
                 [context_features.mean(dim=0), context_features.max(dim=0).values],
                 dim=0,
-            )
+            ) # (2*n_features) 为上下文特征的均值和最大值
             global_features = pooled_context.unsqueeze(0).expand(impact_count, -1)
             local_feature_groups.append(local_features)
             global_feature_groups.append(global_features)
@@ -364,15 +437,16 @@ class MyPipeline(pl.LightningModule):
         global_features = torch.cat(global_feature_groups, dim=0)
         
         output, aux_data = self.acoustic_head(local_features, global_features, point_xyz, mode=self.prediction_mode)
-        loss, smooth_l1_loss, emd_loss, mode_loss = self.compute_loss_terms(output, targets, aux_data)
-        return loss, output, smooth_l1_loss, emd_loss, mode_loss
+        loss, smooth_l1_loss, emd_loss, mode_loss, energy_loss = self.compute_loss_terms(output, targets, aux_data)
+        return loss, output, smooth_l1_loss, emd_loss, mode_loss, energy_loss
 
     def training_step(self, batch, batch_idx):
-        loss, output, smooth_l1_loss, emd_loss, mode_loss = self(batch)
+        loss, output, smooth_l1_loss, emd_loss, mode_loss, energy_loss = self(batch)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("train_smooth_l1_loss", smooth_l1_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("train_emd_loss", emd_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        if self.prediction_mode in ["bipartite", "anchor"]:
+        self.log("train_energy_loss", energy_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        if self.prediction_mode in ["bipartite", "anchor", "modal_anchor"]:
             self.log("train_mode_loss", mode_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         
         opt = self.optimizers()
@@ -380,7 +454,7 @@ class MyPipeline(pl.LightningModule):
             lr = opt.param_groups[0]["lr"]
             self.log("lr", lr, on_step=False, on_epoch=True, prog_bar=True)
             
-        should_log_train_visualization = (self.current_epoch + 1) % self.train_vis_every_n_epochs == 0
+        should_log_train_visualization = (self.current_epoch) % self.train_vis_every_n_epochs == 0
         if batch_idx == 0 and should_log_train_visualization and getattr(self.logger, "experiment", None) is not None:
             targets = self.build_targets(batch)
             report = self.build_prediction_report(batch, targets, output, loss, stage="train")
@@ -392,7 +466,8 @@ class MyPipeline(pl.LightningModule):
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("val_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("val_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        if self.prediction_mode in ["bipartite", "anchor"]:
+        self.log("val_energy_loss", energy_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        if self.prediction_mode in ["bipartite", "anchor", "modal_anchor"]:
             self.log("val_mode_loss", mode_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
             
         if batch_idx == 0 and getattr(self.logger, "experiment", None) is not None:
@@ -406,7 +481,8 @@ class MyPipeline(pl.LightningModule):
         self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("test_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("test_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        if self.prediction_mode in ["bipartite", "anchor"]:
+        self.log("test_energy_loss", energy_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        if self.prediction_mode in ["bipartite", "anchor", "modal_anchor"]:
             self.log("test_mode_loss", mode_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         return loss
 

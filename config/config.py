@@ -8,8 +8,10 @@ class Config:
     # 每个 batch 中包含的 mesh 数量
     BATCH_SIZE = 1
     # 最大训练轮数
-    MAX_EPOCHS = 500
-    DATASET_PERCENT = 3.0
+    MAX_EPOCHS = 5000
+    # 最大样本数量
+    OBJ_LIMIT = 1 # =1时为在单个样本上过拟合的测试，此时训练集和验证集都为单个相同物体
+    DATASET_PERCENT = 100
     VAL_EVERY_N_EPOCHS = 10
     TRAIN_VIS_EVERY_N_EPOCHS = 10
     # 早停耐心值：如果验证集 loss 在多少个 epoch 内没有下降，就提前停止。如果设为足够大（如 500），等同于关闭早停
@@ -21,21 +23,29 @@ class Config:
     # bipartite：匈牙利
     # anchor: 类似 YOLO
     # direct: 直接预测
-    PREDICTION_MODE = "anchor" 
+    # modal_anchor: 模态锚点预测, 见current_methods.md
+    # PREDICTION_MODE = "anchor" 
+    PREDICTION_MODE = "modal_anchor"
+
+    # 固定分箱
+    USE_MODAL_BINS = True
     
     # 训练设备类型，可选 cpu / cuda / mps
     DEVICE = "cuda"
     
     # --- GPU 配置 ---
     # 模式1：手动指定 GPU (例如 [0, 1])。如果不为空，则直接使用指定的 GPU
-    GPU_IDS = [4]
+    GPU_IDS = [3]
     # 模式2：自动寻找空闲 GPU。如果 AUTO_FIND_GPUS 为 True，则忽略 GPU_IDS，自动寻找 DEVICES 个空闲 GPU
     AUTO_FIND_GPUS = False
     # 使用的设备数量（手动指定时会被自动同步，自动寻找时用于指定寻找的数量）
     DEVICES = 1
 
     # 数据根目录
-    DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "vv++test")
+    DATA_DIR = "/mnt/GIL-NFS/xuchenxi/vv++/objaverse-gen"
+    # 缓存目录
+    CACHE_DIR = "/mnt/GIL-NFS/xuchenxi/vvpp-project/.cache"
+    
     # DataLoader worker 数量
     NUM_WORKERS = 8
 

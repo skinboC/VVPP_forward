@@ -185,7 +185,7 @@ from config.config import cfg
 
 
 class VVImpactDataset(Dataset):
-    def __init__(self, data_dir=None, sample_rate=16000, transform_image=None, train_only=False):
+    def __init__(self, data_dir=None, sample_rate=16000, transform_image=None, train_only=False, obj_limit=None):
         self.data_dir = self.resolve_data_dir(data_dir or cfg.DATA_DIR)
         self.sample_rate = sample_rate
         self.train_only = train_only
@@ -195,18 +195,21 @@ class VVImpactDataset(Dataset):
         ])
         self.spec_transform = T.ToTensor()
         self.samples = []
+        self.sampled_num = 0
+        self.obj_limit = obj_limit
         self.mesh_cache = {}
         self.remesh_cache = {}
         self.interp_cache = {}
         self.octree_cache = {}
         self.resampler_cache = {}
         self.spec_tensor_cache = {}
-        self.spec_cache_dir = os.path.join(self.data_dir, ".cache", "impact_specs")
+        self.cache_dir = getattr(cfg, "CACHE_DIR", os.path.join(self.data_dir, ".cache"))
+        self.spec_cache_dir = os.path.join(self.cache_dir, "impact_specs")
         os.makedirs(self.spec_cache_dir, exist_ok=True)
 
         specs_dir = os.path.join(self.data_dir, "impact_specs")
         audio_dir = os.path.join(self.data_dir, "impact_audio")
-        msh_dir = os.path.join(self.data_dir, "msh")
+        msh_dir = os.path.join(self.data_dir, "remesh")
         remesh_dir = os.path.join(self.data_dir, "remesh")
         if not os.path.isdir(specs_dir) or not os.path.isdir(audio_dir) or not os.path.isdir(msh_dir) or not os.path.isdir(remesh_dir):
             return
@@ -219,6 +222,9 @@ class VVImpactDataset(Dataset):
             if not os.path.isdir(group_specs_dir) or not os.path.isdir(group_audio_dir) or not os.path.isdir(group_msh_dir) or not os.path.isdir(group_remesh_dir):
                 continue
             for obj_id in sorted(os.listdir(group_specs_dir)):
+                if self.sampled_num >= self.obj_limit:
+                    break
+                self.sampled_num += 1
                 obj_specs_dir = os.path.join(group_specs_dir, obj_id)
                 obj_audio_dir = os.path.join(group_audio_dir, obj_id)
                 msh_path = os.path.join(group_msh_dir, f"{obj_id}.obj_.msh")
@@ -282,6 +288,9 @@ class VVImpactDataset(Dataset):
             with Image.open(spec_path) as spec_image:
                 spec_tensor = self.spec_transform(spec_image.convert("L")).squeeze(0)
             self.save_spec_tensor_cache(cache_path, spec_tensor)
+            
+        # 删去spec的前两列，以规避边界问题
+        spec_tensor = spec_tensor[:, 2:]
 
         self.spec_tensor_cache[spec_path] = {
             "mtime": spec_mtime,
@@ -351,6 +360,7 @@ class VVImpactDataset(Dataset):
         return cached
 
     def load_spec(self, spec_path):
+        # TODO: 后续改成从音频现算频谱，而不是从图片加载。从图片加载可能不准确，但是可以作为测试模型的可训练性与可视化用
         spec_tensor = self.load_spec_tensor(spec_path)
         if self.train_only:
             return spec_tensor, None
