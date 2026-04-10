@@ -183,7 +183,7 @@ class AcousticFieldHead(nn.Module):
             # offset: 在 bin 内部的相对偏移，限制在 [0, 1]
             offset = torch.sigmoid(out[..., 1])
             # 计算绝对频率
-            bin_centers = torch.arange(self.num_modal_bins, device=features.device).float() / self.num_modal_bins
+            bin_centers = (torch.arange(self.num_modal_bins, device=features.device).float() + 0.5) / self.num_modal_bins
             freqs = bin_centers.unsqueeze(0) + (offset - 0.5) / self.num_modal_bins
             freqs = freqs.clamp(0, 1)
         else:

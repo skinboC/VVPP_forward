@@ -10,7 +10,7 @@ class Config:
     # 最大训练轮数
     MAX_EPOCHS = 5000
     # 最大样本数量
-    OBJ_LIMIT = 2
+    OBJ_LIMIT = 1
     DATASET_PERCENT = 100
     VAL_EVERY_N_EPOCHS = 10
     TRAIN_VIS_EVERY_N_EPOCHS = 10
@@ -23,7 +23,12 @@ class Config:
     # bipartite：匈牙利
     # anchor: 类似 YOLO
     # direct: 直接预测
-    PREDICTION_MODE = "anchor" 
+    # modal_anchor: 模态锚点预测, 见current_methods.md
+    # PREDICTION_MODE = "anchor" 
+    PREDICTION_MODE = "modal_anchor"
+
+    # 固定分箱
+    USE_MODAL_BINS = True
     
     # 训练设备类型，可选 cpu / cuda / mps
     DEVICE = "cuda"
@@ -38,6 +43,8 @@ class Config:
 
     # 数据根目录
     DATA_DIR = "/mnt/GIL-NFS/xuchenxi/vv++/objaverse-gen"
+    # 缓存目录
+    CACHE_DIR = "/mnt/GIL-NFS/xuchenxi/vvpp-project/.cache"
     
     # DataLoader worker 数量
     NUM_WORKERS = 8

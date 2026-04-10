@@ -203,7 +203,8 @@ class VVImpactDataset(Dataset):
         self.octree_cache = {}
         self.resampler_cache = {}
         self.spec_tensor_cache = {}
-        self.spec_cache_dir = os.path.join(self.data_dir, ".cache", "impact_specs")
+        self.cache_dir = getattr(cfg, "CACHE_DIR", os.path.join(self.data_dir, ".cache"))
+        self.spec_cache_dir = os.path.join(self.cache_dir, "impact_specs")
         os.makedirs(self.spec_cache_dir, exist_ok=True)
 
         specs_dir = os.path.join(self.data_dir, "impact_specs")
@@ -287,6 +288,9 @@ class VVImpactDataset(Dataset):
             with Image.open(spec_path) as spec_image:
                 spec_tensor = self.spec_transform(spec_image.convert("L")).squeeze(0)
             self.save_spec_tensor_cache(cache_path, spec_tensor)
+            
+        # 删去spec的前两列，以规避边界问题
+        spec_tensor = spec_tensor[:, 2:]
 
         self.spec_tensor_cache[spec_path] = {
             "mtime": spec_mtime,
