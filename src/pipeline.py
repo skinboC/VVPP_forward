@@ -19,6 +19,7 @@ from config.config import cfg
 import src.models.ocnn_model_ref.my_ocnn as ocnn_unet
 import librosa
 import soundfile as sf
+from scipy import linalg
 
 class AcousticFieldHead(nn.Module):
     def __init__(self, hidden_dim, output_dim, pe_frequencies=6, attention_heads=4, num_peaks=12, use_modal_bins=True):
@@ -480,6 +481,10 @@ class MyPipeline(pl.LightningModule):
                 audio_pred = self.sample_audio_from_bin(batch, output)
             audio_gt_path = batch["impact_audio_path"][0][0]
             audio_gt, _ = librosa.load(audio_gt_path, sr=self.sample_rate)
+            
+            frechet_dist = self.compute_frechet_distance(audio_pred, audio_gt)
+            self.log("train_frechet_distance", frechet_dist, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
+
 
             self.logger.experiment.add_audio("train/pred_audio", audio_pred, self.current_epoch)
             self.logger.experiment.add_audio("train/gt_audio", audio_gt, self.current_epoch)
@@ -493,6 +498,42 @@ class MyPipeline(pl.LightningModule):
             # audio_gt_path = batch["impact_audio_path"][0]
         return loss
     
+    def compute_frechet_distance(self, audio_pred, audio_gt):
+        """
+        计算两段音频的简化版 Fréchet Audio Distance (基于 MFCC 特征)
+        由于标准的 FAD 需要庞大的预训练模型，这里使用 MFCC 特征来近似评估两段音频特征分布的 Fréchet 距离
+        """
+        # 提取 MFCC 特征，并确保两段音频长度一致
+        min_len = min(len(audio_pred), len(audio_gt))
+        if min_len == 0:
+            return 0.0
+        audio_pred = audio_pred[:min_len]
+        audio_gt = audio_gt[:min_len]
+        
+        mfcc_pred = librosa.feature.mfcc(y=audio_pred, sr=self.sample_rate, n_mfcc=20).T
+        mfcc_gt = librosa.feature.mfcc(y=audio_gt, sr=self.sample_rate, n_mfcc=20).T
+        
+        # 计算均值和协方差矩阵
+        mu_pred = np.mean(mfcc_pred, axis=0)
+        sigma_pred = np.cov(mfcc_pred, rowvar=False)
+        
+        mu_gt = np.mean(mfcc_gt, axis=0)
+        sigma_gt = np.cov(mfcc_gt, rowvar=False)
+        
+        diff = mu_pred - mu_gt
+        
+        # 计算协方差矩阵乘积的平方根
+        covmean, _ = linalg.sqrtm(sigma_pred.dot(sigma_gt), disp=False)
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+            
+        # Fréchet 距离公式: ||mu1 - mu2||^2 + Tr(Sigma1 + Sigma2 - 2*sqrt(Sigma1*Sigma2))
+        fad = diff.dot(diff) + np.trace(sigma_pred + sigma_gt - 2.0 * covmean)
+        print(f"Frechet Distance: {fad:.4f}")
+        
+        # 避免极小的负数由于浮点误差产生
+        return max(0.0, float(fad))
+
     def sample_audio_from_anchor(self, batch, aux_data):
         sample_idx = 0
         anchors = aux_data[sample_idx]
@@ -590,6 +631,18 @@ class MyPipeline(pl.LightningModule):
         if self.prediction_mode in ["bipartite", "anchor", "modal_anchor"]:
             self.log("val_mode_loss", mode_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
             
+        # 计算 Fréchet 距离
+        if self.prediction_mode == "modal_anchor":
+            audio_pred = self.sample_audio_from_anchor(batch, aux_data)
+        else:
+            audio_pred = self.sample_audio_from_bin(batch, output)
+            
+        audio_gt_path = batch["impact_audio_path"][0][0]
+        audio_gt, _ = librosa.load(audio_gt_path, sr=self.sample_rate)
+        
+        frechet_dist = self.compute_frechet_distance(audio_pred, audio_gt)
+        self.log("val_frechet_distance", frechet_dist, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
+            
         if batch_idx == 0 and getattr(self.logger, "experiment", None) is not None:
             targets = self.build_targets(batch)
             report = self.build_prediction_report(batch, targets, output, loss, stage="val")
@@ -604,6 +657,19 @@ class MyPipeline(pl.LightningModule):
         self.log("test_energy_loss", energy_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         if self.prediction_mode in ["bipartite", "anchor", "modal_anchor"]:
             self.log("test_mode_loss", mode_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+            
+        # 计算 Fréchet 距离
+        if self.prediction_mode == "modal_anchor":
+            audio_pred = self.sample_audio_from_anchor(batch, aux_data)
+        else:
+            audio_pred = self.sample_audio_from_bin(batch, output)
+            
+        audio_gt_path = batch["impact_audio_path"][0][0]
+        audio_gt, _ = librosa.load(audio_gt_path, sr=self.sample_rate)
+        
+        frechet_dist = self.compute_frechet_distance(audio_pred, audio_gt)
+        self.log("test_frechet_distance", frechet_dist, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
+            
         return loss
 
     def configure_optimizers(self):

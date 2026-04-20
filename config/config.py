@@ -12,8 +12,8 @@ class Config:
     # 最大样本数量
     OBJ_LIMIT = 1 # =1时为在单个样本上过拟合的测试，此时训练集和验证集都为单个相同物体
     DATASET_PERCENT = 100
-    VAL_EVERY_N_EPOCHS = 50
-    TRAIN_VIS_EVERY_N_EPOCHS = 50
+    VAL_EVERY_N_EPOCHS = 10
+    TRAIN_VIS_EVERY_N_EPOCHS = 10
     # 早停耐心值：如果验证集 loss 在多少个 epoch 内没有下降，就提前停止。如果设为足够大（如 500），等同于关闭早停
     EARLY_STOP_PATIENCE = 50
     # 权重衰减系数
