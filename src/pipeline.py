@@ -17,7 +17,8 @@ if project_root not in sys.path:
 
 from config.config import cfg
 import src.models.ocnn_model_ref.my_ocnn as ocnn_unet
-
+import librosa
+import soundfile as sf
 
 class AcousticFieldHead(nn.Module):
     def __init__(self, hidden_dim, output_dim, pe_frequencies=6, attention_heads=4, num_peaks=12, use_modal_bins=True):
@@ -151,7 +152,7 @@ class AcousticFieldHead(nn.Module):
         anchors = torch.stack([base_val, freqs, amps, widths], dim=-1)
         return rendered, anchors
 
-    def render_modal_spectrum(self, prob, freqs, amps):
+    def render_modal_spectrum(self, prob, freqs, amps, training=True):
         """将预测的模态参数渲染回连续频谱。使用极小的固定宽度以保证可导性，并结合概率 prob 控制激活"""
         x = torch.linspace(0, 1, self.output_dim, device=freqs.device).view(1, 1, self.output_dim)
         
@@ -159,11 +160,20 @@ class AcousticFieldHead(nn.Module):
         amps = amps.unsqueeze(-1)
         prob = prob.unsqueeze(-1)
         
+        # 使用直通估计器 (Straight-Through Estimator) 实现可导的硬截断
+        # 前向传播时使用阈值截断 (Hard)，反向传播时使用原始的 prob (Soft)
+        threshold = 0.5
+        prob_hard = (prob >= threshold).float()
+        if training:
+            prob_effective = prob_hard.detach() - prob.detach() + prob
+        else:
+            prob_effective = prob_hard
+            
         # 使用极小的固定宽度（例如一个输出像素的宽度），保证梯度平滑传递
         fixed_width = 1.0 / self.output_dim
         
         # 有效振幅 = 存在概率 * 原始振幅
-        effective_amps = prob * amps
+        effective_amps = prob_effective * amps
         
         gaussians = effective_amps * torch.exp(-0.5 * ((x - freqs) / fixed_width) ** 2)
         spectrum = gaussians.sum(dim=1)
@@ -181,10 +191,11 @@ class AcousticFieldHead(nn.Module):
         if self.use_modal_bins:
             # 方案一：强行划分区间 (Fixed Bins)
             # offset: 在 bin 内部的相对偏移，限制在 [0, 1]
-            offset = torch.sigmoid(out[..., 1])
+            offset_scale = 1
+            offset = torch.sigmoid(out[..., 1]) * offset_scale
             # 计算绝对频率
             bin_centers = (torch.arange(self.num_modal_bins, device=features.device).float() + 0.5) / self.num_modal_bins
-            freqs = bin_centers.unsqueeze(0) + (offset - 0.5) / self.num_modal_bins
+            freqs = bin_centers.unsqueeze(0) + (offset - offset_scale / 2) / self.num_modal_bins
             freqs = freqs.clamp(0, 1)
         else:
             # 路线 B：无匹配的集合预测 (Free Continuous Set Prediction)
@@ -192,7 +203,7 @@ class AcousticFieldHead(nn.Module):
             freqs = torch.sigmoid(out[..., 1])
         
         # 渲染频谱
-        rendered = self.render_modal_spectrum(prob, freqs, amps)
+        rendered = self.render_modal_spectrum(prob, freqs, amps, training=self.training)
         
         # 将 prob, freqs, amps 打包作为锚点输出，供后续计算辅助 loss 或可视化使用
         anchors = torch.stack([prob, freqs, amps], dim=-1)
@@ -229,6 +240,7 @@ class MyPipeline(pl.LightningModule):
         self.prediction_mode = getattr(cfg, "PREDICTION_MODE", "direct")
         self.use_modal_bins = getattr(cfg, "USE_MODAL_BINS", True)  # 新增开关，默认True(使用方案一)
         self.sparse_penalty_weight = getattr(cfg, "SPARSE_PENALTY_WEIGHT", 0.01)  # 稀疏损失权重
+        self.sample_rate = getattr(cfg, "SAMPLE_RATE", 32000)
         
         self.learning_rate = learning_rate if learning_rate is not None else getattr(cfg, "LEARNING_RATE", 1e-3)
         self.hidden_dim = getattr(cfg, "HIDDEN_DIM", 256)
@@ -273,7 +285,7 @@ class MyPipeline(pl.LightningModule):
         target_energy = targets.sum(dim=-1)
         energy_loss = F.l1_loss(pred_energy, target_energy)
         
-        total_loss = smooth_l1_loss * 10.0 + emd_loss * 1.0 + energy_loss * 0.1
+        total_loss = smooth_l1_loss * 10.0 + emd_loss * 1.0 + energy_loss * 0.01
         mode_loss = torch.tensor(0.0, device=self.device)
         
         # 4. 模态稀疏惩罚 (针对 modal_anchor 方案及无匹配集合预测方案)
@@ -397,6 +409,7 @@ class MyPipeline(pl.LightningModule):
         fig.canvas.draw()
         image = torch.from_numpy(np.asarray(fig.canvas.buffer_rgba()).copy()[..., :3]).permute(2, 0, 1)
         plt.close(fig)
+       
         return image
 
     def forward(self, batch_data):
@@ -438,10 +451,10 @@ class MyPipeline(pl.LightningModule):
         
         output, aux_data = self.acoustic_head(local_features, global_features, point_xyz, mode=self.prediction_mode)
         loss, smooth_l1_loss, emd_loss, mode_loss, energy_loss = self.compute_loss_terms(output, targets, aux_data)
-        return loss, output, smooth_l1_loss, emd_loss, mode_loss, energy_loss
+        return loss, output, smooth_l1_loss, emd_loss, mode_loss, energy_loss, aux_data
 
     def training_step(self, batch, batch_idx):
-        loss, output, smooth_l1_loss, emd_loss, mode_loss, energy_loss = self(batch)
+        loss, output, smooth_l1_loss, emd_loss, mode_loss, energy_loss, aux_data = self(batch)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("train_smooth_l1_loss", smooth_l1_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("train_emd_loss", emd_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
@@ -459,10 +472,117 @@ class MyPipeline(pl.LightningModule):
             targets = self.build_targets(batch)
             report = self.build_prediction_report(batch, targets, output, loss, stage="train")
             self.logger.experiment.add_image("train/gt_pred_absdiff", report, self.current_epoch)
+            
+            # generate sample audio
+            if self.prediction_mode == "modal_anchor":
+                audio_pred = self.sample_audio_from_anchor(batch, aux_data)
+            else:
+                audio_pred = self.sample_audio_from_bin(batch, output)
+            audio_gt_path = batch["impact_audio_path"][0][0]
+            audio_gt, _ = librosa.load(audio_gt_path, sr=self.sample_rate)
+
+            self.logger.experiment.add_audio("train/pred_audio", audio_pred, self.current_epoch)
+            self.logger.experiment.add_audio("train/gt_audio", audio_gt, self.current_epoch)
+            
+                        
+            log_audio_path = getattr(cfg, "OUTPUT_AUDIO_DIR", "logs/output_audio/") + self.prediction_mode + "/"
+            os.makedirs(log_audio_path, exist_ok=True)
+            sf.write(os.path.join(log_audio_path, f"train_pred_{self.current_epoch}.wav"), audio_pred, self.sample_rate)
+            sf.write(os.path.join(log_audio_path, f"train_gt_{self.current_epoch}.wav"), audio_gt, self.sample_rate)
+                
+            # audio_gt_path = batch["impact_audio_path"][0]
         return loss
+    
+    def sample_audio_from_anchor(self, batch, aux_data):
+        sample_idx = 0
+        anchors = aux_data[sample_idx]
+        probs = anchors[..., 0]
+        freqs = anchors[..., 1] * self.sample_rate / 2
+        amps = anchors[..., 2]
+        
+        # 将probs < prob_threshold的amps设置为0 
+        prob_threshold = 0.5
+        # amps = amps * probs
+        mask = probs < prob_threshold
+        
+        # 现在amps为[0, 1]对数标度，将其映射到[-80, 0]dB，再映射到线性振幅
+        amps_db = (amps - 1) * 80
+        amps_linear = 10 ** (amps_db / 20)
+        amps_linear[mask] = 0
+        
+        # damping coef
+        alpha = batch["material_data"][sample_idx][3]
+        beta = batch["material_data"][sample_idx][4]
+        omega = freqs * 2 * np.pi
+        damp_per_mode = 0.5 * (alpha + beta * (omega**2))
+        
+        # generate 1s audio
+        dt = 1.0 / float(self.sample_rate)
+        n_steps = int(self.sample_rate * 1.0)
+        t = dt * np.arange(n_steps, dtype=np.float64)
+        
+        def to_numpy(x):
+            return x.detach().cpu().numpy() if hasattr(x, 'detach') else np.array(x)
+            
+        f = to_numpy(freqs)[:, None]
+        a = to_numpy(amps_linear)[:, None]
+        d = to_numpy(damp_per_mode)[:, None]
+        t_2d = t[None, :]
+        
+        # Modal sound synthesis formula: A * exp(-d * t) * sin(2 * pi * f * t)
+        modes_audio = a * np.exp(-d * t_2d) * np.sin(2 * np.pi * f * t_2d)
+        audio = np.sum(modes_audio, axis=0)
+        
+        # Normalize to prevent clipping
+        max_amp = np.max(np.abs(audio))
+        if max_amp > 0:
+            audio = audio / max_amp
+            
+        return audio
+    
+    def sample_audio_from_bin(self, batch, output):
+        sample_idx = 0
+        amps = output[0]
+        amps_db = (amps - 1) * 80
+        amps_linear = 10 ** (amps_db / 20)
+        amps_linear[amps <= -1] = 0
+        
+        bin_num = amps.shape[0]
+        freq_limit = self.sample_rate / 2
+        freqs = freq_limit * ((np.arange(bin_num) + 0.5) / bin_num)
+        
+        # damping coef
+        alpha = batch["material_data"][sample_idx][3]
+        beta = batch["material_data"][sample_idx][4]
+        omega = freqs * 2 * np.pi
+        damp_per_mode = 0.5 * (alpha + beta * (omega**2))
+        
+        # generate 1s audio
+        dt = 1.0 / float(self.sample_rate)
+        n_steps = int(self.sample_rate * 1.0)
+        t = dt * np.arange(n_steps, dtype=np.float64)
+        def to_numpy(x):
+            return x.detach().cpu().numpy() if hasattr(x, 'detach') else np.array(x)
+            
+        f = to_numpy(freqs)[:, None]
+        a = to_numpy(amps_linear)[:, None]
+        d = to_numpy(damp_per_mode)[:, None]
+        t_2d = t[None, :]
+        
+        # Modal sound synthesis formula: A * exp(-d * t) * sin(2 * pi * f * t)
+        modes_audio = a * np.exp(-d * t_2d) * np.sin(2 * np.pi * f * t_2d)
+        audio = np.sum(modes_audio, axis=0)
+        
+        # Normalize to prevent clipping
+        max_amp = np.max(np.abs(audio))
+        if max_amp > 0:
+            audio = audio / max_amp
+            
+        return audio
+        
 
     def validation_step(self, batch, batch_idx):
-        loss, output, smooth_l1_loss, emd_loss, mode_loss = self(batch)
+        loss, output, smooth_l1_loss, emd_loss, mode_loss, energy_loss, aux_data = self(batch)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("val_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("val_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
@@ -477,7 +597,7 @@ class MyPipeline(pl.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, _, smooth_l1_loss, emd_loss, mode_loss = self(batch)
+        loss, _, smooth_l1_loss, emd_loss, mode_loss, energy_loss, aux_data  = self(batch)
         self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("test_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("test_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())

@@ -8,12 +8,12 @@ class Config:
     # 每个 batch 中包含的 mesh 数量
     BATCH_SIZE = 1
     # 最大训练轮数
-    MAX_EPOCHS = 5000
+    MAX_EPOCHS = 10000
     # 最大样本数量
     OBJ_LIMIT = 1 # =1时为在单个样本上过拟合的测试，此时训练集和验证集都为单个相同物体
     DATASET_PERCENT = 100
-    VAL_EVERY_N_EPOCHS = 10
-    TRAIN_VIS_EVERY_N_EPOCHS = 10
+    VAL_EVERY_N_EPOCHS = 50
+    TRAIN_VIS_EVERY_N_EPOCHS = 50
     # 早停耐心值：如果验证集 loss 在多少个 epoch 内没有下降，就提前停止。如果设为足够大（如 500），等同于关闭早停
     EARLY_STOP_PATIENCE = 50
     # 权重衰减系数
@@ -46,6 +46,9 @@ class Config:
     # 缓存目录
     CACHE_DIR = "/mnt/GIL-NFS/xuchenxi/vvpp-project/.cache"
     
+    # 输出声音目录
+    OUTPUT_AUDIO_DIR = "logs/output_audio/"
+    
     # DataLoader worker 数量
     NUM_WORKERS = 8
 
@@ -55,7 +58,7 @@ class Config:
     OUTPUT_DIM = 256
 
     # 音频采样率
-    SAMPLE_RATE = 16000
+    SAMPLE_RATE = 32000
     # 拉普拉斯特征模态数量
     N_EIGENMODES = 64
     # 八叉树最大深度

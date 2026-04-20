@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from config.config import cfg
 import librosa
+from src.matset import MatSet
+import json
 
 
 
@@ -186,7 +188,7 @@ import librosa
 
 
 class VVImpactDataset(Dataset):
-    def __init__(self, data_dir=None, sample_rate=16000, transform_image=None, train_only=False, obj_limit=None):
+    def __init__(self, data_dir=None, sample_rate=32000, transform_image=None, train_only=False, obj_limit=None):
         self.data_dir = self.resolve_data_dir(data_dir or cfg.DATA_DIR)
         self.sample_rate = sample_rate
         self.train_only = train_only
@@ -207,11 +209,15 @@ class VVImpactDataset(Dataset):
         self.cache_dir = getattr(cfg, "CACHE_DIR", os.path.join(self.data_dir, ".cache"))
         self.spec_cache_dir = os.path.join(self.cache_dir, "impact_specs")
         os.makedirs(self.spec_cache_dir, exist_ok=True)
+        self.matset = MatSet()
 
         specs_dir = os.path.join(self.data_dir, "impact_specs")
         audio_dir = os.path.join(self.data_dir, "impact_audio")
         msh_dir = os.path.join(self.data_dir, "remesh")
         remesh_dir = os.path.join(self.data_dir, "remesh")
+        material_path = os.path.join(self.data_dir, "material.json")
+        self.material_dict = json.load(open(material_path, "r"))
+        
         if not os.path.isdir(specs_dir) or not os.path.isdir(audio_dir) or not os.path.isdir(msh_dir) or not os.path.isdir(remesh_dir):
             return
 
@@ -310,8 +316,8 @@ class VVImpactDataset(Dataset):
         # spec = librosa.feature.melspectrogram(y=audio, sr=sr, n_mels=256, fmax=16000)
         D = librosa.stft(audio, n_fft=512)
         S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max) # [-80, 0]
-        # to [-1, 1]
-        spec = (S_db + 40) / 40
+        # to [0, 1]
+        spec = (S_db + 80) / 80
         return spec
 
     def __len__(self):
@@ -411,21 +417,22 @@ class VVImpactDataset(Dataset):
         octree_data = self.load_octree(sample["remesh_path"])
         impact_specs = []
         impact_vertex_index = []
-        if not self.train_only:
-            impact_images = []
-            waveforms = []
-            impact_spec_path = []
-            impact_audio_path = []
+        # if not self.train_only:
+        impact_images = []
+        waveforms = []
+        impact_spec_path = []
+        impact_audio_path = []
+        material_idx = self.material_dict[sample["obj_id"]]
+        material_data = self.matset[material_idx]
 
         for impact in sample["samples"]:
             spec_tensor, preview_tensor = self.load_spec(impact["wav_path"], impact["spec_path"])
             impact_specs.append(spec_tensor)
             impact_vertex_index.append(impact["vertex_id"])
-            if not self.train_only:
-                impact_images.append(preview_tensor)
-                waveforms.append(self.load_waveform(impact["wav_path"]))
-                impact_spec_path.append(impact["spec_path"])
-                impact_audio_path.append(impact["wav_path"])
+            impact_images.append(preview_tensor)
+            waveforms.append(self.load_waveform(impact["wav_path"]))
+            impact_spec_path.append(impact["spec_path"])
+            impact_audio_path.append(impact["wav_path"])
 
         impact_vertex_index = torch.tensor(impact_vertex_index, dtype=torch.long)
         impact_point = mesh["vertices"][impact_vertex_index]
@@ -451,14 +458,17 @@ class VVImpactDataset(Dataset):
             "obj_id": sample["obj_id"],
             "group": sample["group"],
             "vertex_id": impact_vertex_index.clone(),
+            "impact_audio_path": impact_audio_path,
+            "impact_spec_path": impact_spec_path,
+            "material_data": material_data,
         }
         if not self.train_only:
             data["impact_image"] = torch.stack(impact_images)
             data["waveform"] = pad_sequence(waveforms, batch_first=True)
             data["waveform_length"] = torch.tensor([wave.size(0) for wave in waveforms], dtype=torch.long)
             data["sample_rate"] = self.sample_rate
-            data["impact_spec_path"] = impact_spec_path
-            data["impact_audio_path"] = impact_audio_path
+            # data["impact_spec_path"] = impact_spec_path
+            # data["impact_audio_path"] = impact_audio_path
         return data
 
 
@@ -483,6 +493,9 @@ def collate_vvimpact_batch(batch):
         "obj_id": [item["obj_id"] for item in batch],
         "group": [item["group"] for item in batch],
         "vertex_id": [item["vertex_id"] for item in batch],
+        "impact_audio_path": [item["impact_audio_path"] for item in batch],
+        "impact_spec_path": [item["impact_spec_path"] for item in batch],
+        "material_data": [item["material_data"] for item in batch],
     }
     collated["octree"].construct_all_neigh()
     if "impact_image" in batch[0]:
@@ -490,8 +503,8 @@ def collate_vvimpact_batch(batch):
         collated["waveform"] = [item["waveform"] for item in batch]
         collated["waveform_length"] = [item["waveform_length"] for item in batch]
         collated["sample_rate"] = batch[0]["sample_rate"]
-        collated["impact_spec_path"] = [item["impact_spec_path"] for item in batch]
-        collated["impact_audio_path"] = [item["impact_audio_path"] for item in batch]
+        # collated["impact_spec_path"] = [item["impact_spec_path"] for item in batch]
+        # collated["impact_audio_path"] = [item["impact_audio_path"] for item in batch]
     return collated
 
 
